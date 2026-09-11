@@ -41,6 +41,3 @@ Benchmarked against Vue 3 using 10,000 reactive ref/computed pairs and 100,000 u
 - Benchmarking individual operations is essential before optimizing.
 - Correct dependency cleanup is just as important as performance.
 
-## Note
-
-NanoReactive is an educational project inspired by studying reactive systems such as Vue. It is not intended to replace Vue or reproduce its full implementation.
