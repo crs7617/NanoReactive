@@ -5,8 +5,8 @@
 // dropping every user-facing reference would still leave the object in
 // the Map, so it could never be garbage collected (a memory leak).
 // WeakMap lets the GC collect a target once nothing else points at it.
-// The nested Map<key, Set<effect>> is the same shape reactive() will need
-// later (one target, many property keys). ref() only has one property, so
+// The nested Map<key, Set<effect>> is one target, many property keys:
+// reactive() tracks each property independently; ref() only has one, so
 // we key it by a per-ref internal object and the fixed key "value".
 const targetMap = new WeakMap();
 
@@ -16,6 +16,13 @@ const VALUE_KEY = "value";
 let activeEffect = null;
 /** Stack so nested effects restore the outer effect when they finish. */
 const effectStack = [];
+
+// Batched effect queue: several sync writes (count.value = 1; count.value = 2)
+// should re-run each affected effect once, not once per write.
+const queuedEffects = new Set();
+let awaitingFlush = false;
+/** Promise that settles after the currently scheduled flush, or null. */
+let currentFlush = null;
 
 function track(target, key) {
   if (!activeEffect) return;
@@ -53,16 +60,60 @@ function trigger(target, key) {
     //   effect(() => { count.value++ })
     // which would recurse until the stack overflows. Skip the currently
     // running effect; it will see its own write via the rest of this run.
-    if (effectFn !== activeEffect) {
-      // Computed (and other lazy subscribers) set .scheduler so a dep
-      // change only marks them stale — they recompute on the next read.
-      if (effectFn.scheduler) {
-        effectFn.scheduler();
-      } else {
+    if (effectFn === activeEffect) continue;
+
+    // Computed (and other lazy subscribers) set .scheduler so a dep
+    // change only marks them stale — they recompute on the next read.
+    // Schedulers stay synchronous so dirty flags land before we queue
+    // the downstream effects that will read those computeds.
+    if (effectFn.scheduler) {
+      effectFn.scheduler();
+    } else {
+      queueEffect(effectFn);
+    }
+  }
+}
+
+function queueEffect(effectFn) {
+  queuedEffects.add(effectFn);
+  scheduleFlush();
+}
+
+function scheduleFlush() {
+  if (awaitingFlush) return;
+  awaitingFlush = true;
+  currentFlush = new Promise((resolve, reject) => {
+    queueMicrotask(() => {
+      try {
+        flushQueue();
+        resolve();
+      } catch (err) {
+        reject(err);
+      } finally {
+        awaitingFlush = false;
+        currentFlush = null;
+      }
+    });
+  });
+}
+
+function flushQueue() {
+  // Drain in a loop so effects that write during the flush still run in
+  // this same microtask instead of scheduling a second one.
+  while (queuedEffects.size > 0) {
+    const jobs = [...queuedEffects];
+    queuedEffects.clear();
+    for (const effectFn of jobs) {
+      if (effectFn !== activeEffect) {
         effectFn();
       }
     }
   }
+}
+
+/** Await the pending effect flush (or resolve immediately if none). */
+export function nextTick() {
+  return currentFlush ?? Promise.resolve();
 }
 
 function cleanup(effectFn) {
@@ -157,4 +208,22 @@ export function ref(initialValue) {
       trigger(target, VALUE_KEY);
     },
   };
+}
+
+export function reactive(target) {
+  // KNOWN LIMITATION: array mutating methods (push, splice, pop, …) are
+  // not special-cased. Those methods write several keys (indices + length)
+  // in ways a plain set trap does not fully observe as "the list changed",
+  // so effects that iterate an array or read .length may miss updates.
+  return new Proxy(target, {
+    get(obj, key, receiver) {
+      track(obj, key);
+      return Reflect.get(obj, key, receiver);
+    },
+    set(obj, key, newValue, receiver) {
+      const result = Reflect.set(obj, key, newValue, receiver);
+      trigger(obj, key);
+      return result;
+    },
+  });
 }
