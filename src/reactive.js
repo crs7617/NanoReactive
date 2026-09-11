@@ -54,7 +54,13 @@ function trigger(target, key) {
     // which would recurse until the stack overflows. Skip the currently
     // running effect; it will see its own write via the rest of this run.
     if (effectFn !== activeEffect) {
-      effectFn();
+      // Computed (and other lazy subscribers) set .scheduler so a dep
+      // change only marks them stale — they recompute on the next read.
+      if (effectFn.scheduler) {
+        effectFn.scheduler();
+      } else {
+        effectFn();
+      }
     }
   }
 }
@@ -89,6 +95,52 @@ export function effect(fn) {
   runner.deps = new Set();
   runner();
   return runner;
+}
+
+export function computed(getter) {
+  // dirty-flag / lazy cache:
+  //   dirty === true  → cached value is missing or stale; run getter on next read
+  //   dirty === false → cached value is still valid; skip getter
+  // Start dirty so we do not run getter until something actually reads .value.
+  let dirty = true;
+  let value;
+  // Separate target so effects that read this computed subscribe to *us*,
+  // not to the inner refs the getter happens to touch.
+  const target = {};
+
+  const runner = () =>
+    runEffect(runner, () => {
+      value = getter();
+    });
+  runner.deps = new Set();
+  // Called by trigger() when an inner dep changes — do not re-run getter here.
+  runner.scheduler = () => {
+    // WHY lazy (dirty flag): recomputing on every dep write is wasted if
+    // nobody reads this computed again. Mark stale and notify *our*
+    // subscribers; the getter runs only when .value is next accessed.
+    // The `if (!dirty)` guard also collapses multiple dep writes between
+    // reads into a single invalidation / trigger.
+    if (!dirty) {
+      dirty = true;
+      trigger(target, VALUE_KEY);
+    }
+  };
+
+  return {
+    get value() {
+      // WHY cache: if no dependency has changed since the last evaluation,
+      // getter() would produce the same result — return the stored value.
+      if (dirty) {
+        runner();
+        dirty = false;
+      }
+      // Make this computed a tracked dep of the currently running effect
+      // (or of another computed that is evaluating). That is what makes
+      // computed composable with effect() and with other computeds.
+      track(target, VALUE_KEY);
+      return value;
+    },
+  };
 }
 
 export function ref(initialValue) {
