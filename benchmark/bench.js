@@ -48,16 +48,23 @@ async function runNano() {
     });
   }
 
-  // Timed workload
-  const start = performance.now();
+  const writeStart = performance.now();
 
   for (let i = 0; i < WRITE_COUNT; i++) {
     refs[i % PAIR_COUNT].value++;
   }
 
-  await nanoNextTick();
+  const writeTime = performance.now() - writeStart;
 
-  return performance.now() - start;
+  const flushStart = performance.now();
+  await nanoNextTick();
+  const flushTime = performance.now() - flushStart;
+
+  return {
+    writeTime,
+    flushTime,
+    totalTime: writeTime + flushTime,
+  };
 }
 
 async function runVue() {
@@ -75,39 +82,52 @@ async function runVue() {
     });
   }
 
-  // Timed workload
-  const start = performance.now();
+  const writeStart = performance.now();
 
   for (let i = 0; i < WRITE_COUNT; i++) {
     refs[i % PAIR_COUNT].value++;
   }
 
-  await vueNextTick();
+  const writeTime = performance.now() - writeStart;
 
-  return performance.now() - start;
+  const flushStart = performance.now();
+  await vueNextTick();
+  const flushTime = performance.now() - flushStart;
+
+  return {
+    writeTime,
+    flushTime,
+    totalTime: writeTime + flushTime,
+  };
 }
 
 async function average(label, run) {
-  const times = [];
+  const samples = [];
 
   // Warm-up run
   await run();
 
   for (let i = 0; i < RUNS; i++) {
-    times.push(await run());
+    samples.push(await run());
   }
 
+  const writeTime =
+    samples.reduce((sum, s) => sum + s.writeTime, 0) / RUNS;
+  const flushTime =
+    samples.reduce((sum, s) => sum + s.flushTime, 0) / RUNS;
   const totalTime =
-    times.reduce((sum, time) => sum + time, 0) / RUNS;
+    samples.reduce((sum, s) => sum + s.totalTime, 0) / RUNS;
 
-  const opsPerSec =
-    WRITE_COUNT / (totalTime / 1000);
+  const opsPerSec = WRITE_COUNT / (totalTime / 1000);
 
   return {
     implementation: label,
+    writeTime,
+    flushTime,
     totalTime,
     opsPerSec,
-    times,
+    writePct: (writeTime / totalTime) * 100,
+    flushPct: (flushTime / totalTime) * 100,
   };
 }
 
@@ -124,9 +144,11 @@ const results = [
   await average("Vue 3", runVue),
 ];
 
-const colImpl = 18;
-const colTime = 20;
-const colOps = 16;
+const colImpl = 16;
+const colWrite = 16;
+const colFlush = 16;
+const colTotal = 16;
+const colOps = 14;
 
 console.log("\nNanoReactive vs Vue 3");
 console.log(
@@ -137,20 +159,31 @@ console.log(`${RUNS} measured runs + 1 warm-up\n`);
 
 console.log(
   pad("implementation", colImpl) +
-    pad("avg time (ms)", colTime) +
+    pad("write time", colWrite) +
+    pad("flush time", colFlush) +
+    pad("total time", colTotal) +
     padStart("ops/sec", colOps),
 );
 
-console.log("-".repeat(colImpl + colTime + colOps));
+console.log("-".repeat(colImpl + colWrite + colFlush + colTotal + colOps));
 
 for (const row of results) {
   console.log(
     pad(row.implementation, colImpl) +
-      pad(row.totalTime.toFixed(2), colTime) +
+      pad(row.writeTime.toFixed(2) + " ms", colWrite) +
+      pad(row.flushTime.toFixed(2) + " ms", colFlush) +
+      pad(row.totalTime.toFixed(2) + " ms", colTotal) +
       padStart(
         Math.round(row.opsPerSec).toLocaleString("en-US"),
         colOps,
       ),
+  );
+}
+
+console.log("\nShare of total time:");
+for (const row of results) {
+  console.log(
+    `${row.implementation}: writes ${row.writePct.toFixed(1)}% / flush ${row.flushPct.toFixed(1)}%`,
   );
 }
 
