@@ -40,7 +40,8 @@ function track(target, key) {
   }
 
   dep.add(activeEffect);
-  // Record this dep Set on the effect so cleanup() can unsubscribe later.
+  activeEffect.trackedDeps.add(dep);
+  // Record this dep Set on the effect so stale subscriptions can be removed.
   activeEffect.deps.add(dep);
 }
 
@@ -116,25 +117,20 @@ export function nextTick() {
   return currentFlush ?? Promise.resolve();
 }
 
-function cleanup(effectFn) {
-  // WHY stale-dep cleanup: an effect's set of reads can change between
-  // runs (e.g. `if (ok.value) n.value`). Without clearing old subscriptions
-  // first, the effect would stay registered on refs it no longer reads, and
-  // would keep re-running for irrelevant writes (wasted work, and often
-  // wrong when the branch is meant to be "off").
-  for (const dep of effectFn.deps) {
-    dep.delete(effectFn);
-  }
-  effectFn.deps.clear();
-}
-
 function runEffect(effectFn, fn) {
-  cleanup(effectFn);
+  effectFn.trackedDeps.clear();
   effectStack.push(effectFn);
   activeEffect = effectFn;
   try {
     fn();
   } finally {
+    // Keep stable subscriptions and remove only dependencies no longer read.
+    for (const dep of effectFn.deps) {
+      if (!effectFn.trackedDeps.has(dep)) {
+        dep.delete(effectFn);
+        effectFn.deps.delete(dep);
+      }
+    }
     effectStack.pop();
     activeEffect = effectStack[effectStack.length - 1] ?? null;
   }
@@ -144,6 +140,7 @@ export function effect(fn) {
   const runner = () => runEffect(runner, fn);
   // Each effect tracks the dep Sets it currently belongs to.
   runner.deps = new Set();
+  runner.trackedDeps = new Set();
   runner();
   return runner;
 }
@@ -155,15 +152,14 @@ export function computed(getter) {
   // Start dirty so we do not run getter until something actually reads .value.
   let dirty = true;
   let value;
-  // Separate target so effects that read this computed subscribe to *us*,
-  // not to the inner refs the getter happens to touch.
-  const target = {};
+  const dep = new Set();
 
   const runner = () =>
     runEffect(runner, () => {
       value = getter();
     });
   runner.deps = new Set();
+  runner.trackedDeps = new Set();
   // Called by trigger() when an inner dep changes — do not re-run getter here.
   runner.scheduler = () => {
     // WHY lazy (dirty flag): recomputing on every dep write is wasted if
@@ -173,7 +169,15 @@ export function computed(getter) {
     // reads into a single invalidation / trigger.
     if (!dirty) {
       dirty = true;
-      trigger(target, VALUE_KEY);
+      for (const effectFn of dep) {
+        if (effectFn === activeEffect) continue;
+
+        if (effectFn.scheduler) {
+          effectFn.scheduler();
+        } else {
+          queueEffect(effectFn);
+        }
+      }
     }
   };
 
@@ -186,9 +190,12 @@ export function computed(getter) {
         dirty = false;
       }
       // Make this computed a tracked dep of the currently running effect
-      // (or of another computed that is evaluating). That is what makes
-      // computed composable with effect() and with other computeds.
-      track(target, VALUE_KEY);
+      // (or of another computed that is evaluating).
+      if (activeEffect) {
+        dep.add(activeEffect);
+        activeEffect.trackedDeps.add(dep);
+        activeEffect.deps.add(dep);
+      }
       return value;
     },
   };
@@ -202,6 +209,7 @@ export function ref(initialValue) {
     get value() {
       if (activeEffect) {
         dep.add(activeEffect);
+        activeEffect.trackedDeps.add(dep);
         activeEffect.deps.add(dep);
       }
       return value;
