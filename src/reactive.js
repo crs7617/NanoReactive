@@ -51,9 +51,9 @@ function trigger(target, key) {
   const dep = depsMap.get(key);
   if (!dep || dep.size === 0) return;
 
-  // Snapshot: an effect may unsubscribe/resubscribe while we iterate.
-  const effects = [...dep];
-  for (const effectFn of effects) {
+  // Effects are queued for the later flush, so cleanup/re-tracking cannot
+  // mutate this dependency Set while it is being traversed.
+  for (const effectFn of dep) {
     // WHY self-trigger guard: if effect A is running and writes a ref that
     // A itself depends on, invoking A from this trigger would re-enter A
     // in the middle of its own execution. A typical loop is
@@ -195,17 +195,31 @@ export function computed(getter) {
 }
 
 export function ref(initialValue) {
-  // Internal target object: WeakMap key, same storage shape as reactive().
-  const target = { [VALUE_KEY]: initialValue };
+  let value = initialValue;
+  const dep = new Set();
 
   return {
     get value() {
-      track(target, VALUE_KEY);
-      return target[VALUE_KEY];
+      if (activeEffect) {
+        dep.add(activeEffect);
+        activeEffect.deps.add(dep);
+      }
+      return value;
     },
     set value(newValue) {
-      target[VALUE_KEY] = newValue;
-      trigger(target, VALUE_KEY);
+      value = newValue;
+      if (dep.size === 0) return;
+
+      const effects = [...dep];
+      for (const effectFn of effects) {
+        if (effectFn === activeEffect) continue;
+
+        if (effectFn.scheduler) {
+          effectFn.scheduler();
+        } else {
+          queueEffect(effectFn);
+        }
+      }
     },
   };
 }
